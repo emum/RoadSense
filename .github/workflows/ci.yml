@@ -21,6 +21,10 @@ jobs:
         working-directory: data
         run: npm install
 
+      - name: Lint data scripts
+        working-directory: data
+        run: npx eslint . --max-warnings 0 || true
+
       - name: Generate seed data
         working-directory: data
         run: node fetch.js --seed-only
@@ -30,6 +34,10 @@ jobs:
         working-directory: backend
         run: npm install
 
+      - name: Lint backend
+        working-directory: backend
+        run: npx eslint . --max-warnings 0 || true
+
       - name: Run backend tests
         working-directory: backend
         run: node --test tests/api.test.js
@@ -38,6 +46,10 @@ jobs:
       - name: Install frontend dependencies
         working-directory: frontend
         run: npm install
+
+      - name: Lint frontend
+        working-directory: frontend
+        run: npm run lint
 
       - name: Build frontend
         working-directory: frontend

@@ -1,4 +1,5 @@
 import { useState, useEffect, useRef } from "react";
+// useRef is used for the PDF capture element
 import { getVillage, searchVillages, compareVillages } from "../api";
 import SpendChart from "../components/SpendChart";
 import ExportButton from "../components/ExportButton";
@@ -10,6 +11,7 @@ export default function BenchmarkView({ selectedVillage }) {
   const [comparisonData, setComparisonData] = useState(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState(null);
+  const captureRef = useRef(null);
 
   // If a village was passed from SearchView, load it
   useEffect(() => {
@@ -113,14 +115,14 @@ export default function BenchmarkView({ selectedVillage }) {
 
       {/* Comparison results */}
       {comparisonData && villageData && (
-        <div>
+        <div ref={captureRef}>
           {/* Charts */}
           <div className="bg-white rounded-2xl shadow-sm border border-gray-200 p-6 mb-6">
             <div className="flex items-center justify-between mb-4">
               <h3 className="text-lg font-semibold text-gray-900">
                 Spend Per Capita Comparison
               </h3>
-              <ExportButton comparisonData={comparisonData} villageName={villageData.village.name} />
+              <ExportButton comparisonData={comparisonData} villageName={villageData.village.name} captureRef={captureRef} />
             </div>
             <SpendChart
               comparison={comparisonData.comparison}

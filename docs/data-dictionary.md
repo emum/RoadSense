@@ -13,8 +13,11 @@ Every field in the RoadSense dataset is documented here with its source and meth
   "fips": "string",
   "population": "number",
   "fiscalYear": "number",
+  "govType": "string",
+  "subType": "string | null",
   "roadSpending": { ... },
-  "benchmarks": { ... },
+  "roadConditionScore": "number | null",
+  "referendumRevenue": "number | null",
   "vendors": [ ... ],
   "metadata": { ... }
 }
@@ -26,12 +29,15 @@ Every field in the RoadSense dataset is documented here with its source and meth
 
 | Field | Type | Source | Description |
 |-------|------|--------|-------------|
-| `id` | string | Generated | Slug of municipality name (e.g., `hawthorn-woods`) |
-| `name` | string | IL Comptroller AFR | Official municipality name as filed |
+| `id` | string | Generated | Slug of municipality name. Townships get `-twp-{county}` suffix, special purpose districts get `-sp-{county}` to avoid collisions (e.g., `lake-villa` vs `lake-villa-twp-lake`). |
+| `name` | string | IL Comptroller AFR | Official municipality name as filed. Townships display with "(Township)" suffix. |
 | `county` | string | IL Comptroller AFR | County of primary jurisdiction |
 | `state` | string | Constant | State abbreviation (`IL`) |
-| `fips` | string | Census | FIPS code for the municipality |
-| `population` | number | U.S. Census ACS 5-year | Most recent population estimate |
+| `fips` | string | IL Comptroller | Comptroller unit code (e.g., `049/190/32`). Format: `{county_code}/{unit_code}/{type_code}`. |
+| `population` | number | IL Comptroller AFR (self-reported) | Population as reported in the AFR UnitStats table. Seed data uses Census figures. |
+| `fiscalYear` | number | IL Comptroller AFR | Fiscal year of the report (e.g., 2025 = FY ending in 2025). |
+| `govType` | string | IL Comptroller AFR | Government type: `Municipality`, `Township`, `Special Purpose`, `County/Community College`. Derived from C1 field: MU, TW, SP, CC. |
+| `subType` | string/null | IL Comptroller AFR | Municipality sub-type where applicable. Derived from C4 field: 30=City, 31=Town, 32=Village. |
 
 ### Road Spending Fields
 
@@ -45,18 +51,58 @@ Every field in the RoadSense dataset is documented here with its source and meth
 | `roadBudgetPercent` | number | Calculated | `totalRoadSpend / totalMunicipalSpend * 100` |
 | `totalMunicipalSpend` | number | IL Comptroller AFR | Total expenditures across all funds |
 
-### Fund Code Mapping (Illinois)
+### Fund Instrument Matching (Illinois Comptroller)
 
-These are the AFR fund types that map to road infrastructure spending:
+Road spending is identified by matching the `Instrument` field in the FundsUsed table against keyword patterns. The Comptroller database uses free-text fund names rather than standardized codes.
 
-| Fund Name | Included | Notes |
-|-----------|----------|-------|
-| Street & Bridge | Yes | Primary road maintenance fund |
-| Road & Bridge | Yes | Used by townships and some villages |
-| Motor Fuel Tax (MFT) | Yes | State-distributed fuel tax revenue earmarked for roads |
-| Special Service Area | Conditional | Only if the SSA is designated for road improvements |
-| Capital Projects | Conditional | Only road/infrastructure line items, not buildings |
-| General Fund | No | Too broad — would inflate numbers. Road line items within General Fund are not captured unless separately reported. |
+**Inclusion patterns** (any match triggers inclusion):
+
+| Pattern | Examples |
+|---------|----------|
+| `road` | "General Road", "Road & Bridge", "Road Damage" |
+| `street` | "Street Improvement", "Home Rule Street Improvement" |
+| `bridge` | "Bridge Construction", "Aid to Bridges", "Bridge Fund" |
+| `motor fuel tax` / `MFT` | "Motor Fuel Tax" |
+| `highway` | "Highway Fund", "Highway Insurance" |
+| `pavement` / `paving` | "Paving Fund" |
+| `curb` / `sidewalk` | "Curb & Gutter" |
+| `storm sewer` | "Street Storm Sewer Improvement" |
+
+**Exclusion patterns** (override inclusion):
+
+| Pattern | Reason |
+|---------|--------|
+| `TIF` | Tax Increment Financing districts named after streets |
+| `business district` | Commercial districts, not road infrastructure |
+| `redevelopment` | Redevelopment zones, not road maintenance |
+| `broadband` / `fiber` | Matches "road" in "Fiber Optic Broadband" |
+
+### Comptroller Database Schema (data2025.accdb)
+
+The bulk download is a Microsoft Access database with these tables:
+
+| Table | Key Fields | Purpose |
+|-------|-----------|---------|
+| `UnitData` | Code, UnitName, County, C1 (gov type), C4 (sub-type) | Municipality identity and contact info |
+| `UnitStats` | Code, FY, Pop, EAV | Population, equalized assessed valuation |
+| `FundsUsed` | Code, FundType, Instrument, Expenditures | Fund names and total expenditures per fund |
+| `Expenditures` | Code, Category, GN/SR/CP/DS/EP/TS/FD/DP/OT | Detailed spending by category and fund type |
+| `Revenues` | Code, Category, GN/SR/CP/DS/EP/TS/FD/DP/OT | Revenue by category and fund type |
+| `Component` | Code, ComponentUnit, Amount | Component units (e.g., Road & Bridge) |
+
+**Fund type columns** in Expenditures/Revenues:
+
+| Column | Meaning |
+|--------|---------|
+| GN | General Fund |
+| SR | Special Revenue |
+| CP | Capital Projects |
+| DS | Debt Service |
+| EP | Enterprise |
+| TS | Trust/Agency |
+| FD | Fiduciary/Pension |
+| DP | Discretely Presented |
+| OT | Other |
 
 ### Condition & Quality Fields
 
@@ -113,3 +159,19 @@ A single municipality may report road spending across multiple funds (e.g., MFT 
 
 ### Preventive vs Reactive
 This classification is approximate. We categorize based on vendor names and fund descriptions when available, but many municipalities don't report at this granularity. When the ratio can't be calculated, it's omitted rather than estimated.
+
+### AI-Extracted Data
+Villages not in the Comptroller database can be added via AI extraction. A user provides a URL or uploads a PDF (treasurer's report, budget document), and Claude extracts structured data. These entries are tagged with `metadata.source` starting with `AI-extracted from` or `upload://`. AI-extracted data should be treated as approximate until manually verified. The extraction prompt instructs the model to include only road-related spending and exclude water/sewer, parks, police, and general admin.
+
+### Address Lookup
+The address lookup feature uses the [U.S. Census Bureau Geocoder](https://geocoding.geo.census.gov/geocoder/) (free, no API key). It returns:
+- **Incorporated Place** — maps to a municipality (village/city) in our dataset
+- **County Subdivision** — maps to a township in our dataset
+
+This allows residents to see both their municipality and township road spending. The county name from the Census (`"Lake County"`) is matched against our dataset (`"Lake"`) using a prefix match.
+
+### Data Quality Notes
+- Population figures in the Comptroller database are self-reported by municipalities and may be outdated or incorrect (e.g., Byron reported pop=1).
+- Seed data for Hawthorn Woods uses manually verified figures from official Treasurer's Reports and is more accurate than Comptroller data.
+- Township and municipality names can collide (e.g., "Lake Villa" village vs "Lake Villa" township). These are deduplicated by appending government type and county to the ID.
+- The FY field in the Comptroller data represents the fiscal year of the report, not necessarily the calendar year. Most IL municipalities have fiscal years ending April 30.
