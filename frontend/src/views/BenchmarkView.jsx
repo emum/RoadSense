@@ -4,7 +4,7 @@ import { getVillage, searchVillages, compareVillages } from "../api";
 import SpendChart from "../components/SpendChart";
 import ExportButton from "../components/ExportButton";
 
-export default function BenchmarkView({ selectedVillage }) {
+export default function BenchmarkView({ selectedVillage, shareCompare }) {
   const [villageName, setVillageName] = useState("");
   const [searchResults, setSearchResults] = useState([]);
   const [villageData, setVillageData] = useState(null);
@@ -20,6 +20,32 @@ export default function BenchmarkView({ selectedVillage }) {
       setVillageName(selectedVillage.name);
     }
   }, [selectedVillage]);
+
+  // If a share link was used (?compare=A,B,C), load that comparison
+  useEffect(() => {
+    if (shareCompare) {
+      const names = shareCompare.split(",").map((n) => decodeURIComponent(n.trim()));
+      if (names.length > 0) {
+        setVillageName(names[0]);
+        loadSharedComparison(names);
+      }
+    }
+  }, [shareCompare]);
+
+  async function loadSharedComparison(names) {
+    setLoading(true);
+    setError(null);
+    try {
+      const data = await getVillage(names[0]);
+      setVillageData(data);
+      const comparison = await compareVillages(names);
+      setComparisonData(comparison);
+    } catch (err) {
+      setError(err.message);
+    } finally {
+      setLoading(false);
+    }
+  }
 
   // Search as user types
   useEffect(() => {
@@ -144,6 +170,29 @@ export default function BenchmarkView({ selectedVillage }) {
                 benchmarks={comparisonData.benchmarks}
                 metric="spendPerLaneMile"
                 label="Spend Per Lane-Mile ($)"
+                highlightId={villageData.village.id}
+              />
+            </div>
+          )}
+
+          {/* Preventive ratio chart (if data available) */}
+          {comparisonData.comparison.some((c) => c.preventiveRatio != null) && (
+            <div className="bg-white rounded-2xl shadow-sm border border-gray-200 p-6 mb-6">
+              <h3 className="text-lg font-semibold text-gray-900 mb-4">
+                Capital Investment Ratio
+              </h3>
+              <p className="text-sm text-gray-500 mb-4">
+                Percentage of road spending going to capital outlay vs maintenance.
+                Higher is generally better — target is 60%+.
+              </p>
+              <SpendChart
+                comparison={comparisonData.comparison.map((c) => ({
+                  ...c,
+                  preventivePercent: c.preventiveRatio != null ? Math.round(c.preventiveRatio * 100) : null,
+                }))}
+                benchmarks={comparisonData.benchmarks}
+                metric="preventivePercent"
+                label="Capital Investment %"
                 highlightId={villageData.village.id}
               />
             </div>

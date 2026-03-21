@@ -275,6 +275,9 @@ app.get("/api/compare", (req, res) => {
     spendPerLaneMile: v.roadSpending.spendPerLaneMile,
     roadBudgetPercent: v.roadSpending.roadBudgetPercent,
     roadConditionScore: v.roadConditionScore,
+    preventiveRatio: v.roadSpending.preventiveRatio,
+    preventiveSpend: v.roadSpending.preventiveSpend,
+    reactiveSpend: v.roadSpending.reactiveSpend,
   }));
 
   res.json({ comparison, notFound, benchmarks });

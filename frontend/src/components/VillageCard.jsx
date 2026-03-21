@@ -1,5 +1,18 @@
 import { useState } from "react";
 import { analyzeVillage } from "../api";
+import { Line } from "react-chartjs-2";
+import {
+  Chart as ChartJS,
+  CategoryScale,
+  LinearScale,
+  PointElement,
+  LineElement,
+  Title,
+  Tooltip,
+  Legend,
+} from "chart.js";
+
+ChartJS.register(CategoryScale, LinearScale, PointElement, LineElement, Title, Tooltip, Legend);
 
 function Stat({ label, value, sublabel, highlight }) {
   return (
@@ -114,7 +127,40 @@ export default function VillageCard({ data, onBenchmark }) {
               value={`${rs.roadBudgetPercent}%`}
             />
           )}
+          {rs.preventiveRatio != null && (
+            <Stat
+              label="Preventive Spend Ratio"
+              value={`${Math.round(rs.preventiveRatio * 100)}%`}
+              sublabel={rs.preventiveRatio < 0.6 ? "Target: 60%+" : "Meets target"}
+              highlight={rs.preventiveRatio < 0.3}
+            />
+          )}
         </div>
+
+        {/* Preventive vs reactive breakdown */}
+        {rs.preventiveSpend != null && rs.reactiveSpend != null && (rs.preventiveSpend + rs.reactiveSpend) > 0 && (
+          <div className="mt-4 p-4 bg-gray-50 rounded-xl">
+            <div className="text-sm font-medium text-gray-700 mb-2">
+              Capital Investment vs Maintenance
+            </div>
+            <div className="flex h-4 rounded-full overflow-hidden bg-gray-200">
+              <div
+                className="bg-blue-500"
+                style={{ width: `${rs.preventiveRatio * 100}%` }}
+                title={`Capital outlay: $${rs.preventiveSpend.toLocaleString()}`}
+              />
+              <div
+                className="bg-amber-400"
+                style={{ width: `${(1 - rs.preventiveRatio) * 100}%` }}
+                title={`Maintenance: $${rs.reactiveSpend.toLocaleString()}`}
+              />
+            </div>
+            <div className="flex justify-between mt-1 text-xs text-gray-500">
+              <span>Capital: ${rs.preventiveSpend.toLocaleString()}</span>
+              <span>Maintenance: ${rs.reactiveSpend.toLocaleString()}</span>
+            </div>
+          </div>
+        )}
 
         {/* Referendum note */}
         {village.referendumRevenue && (
@@ -146,6 +192,94 @@ export default function VillageCard({ data, onBenchmark }) {
                 </span>
               </div>
             ))}
+          </div>
+        </div>
+      )}
+
+      {/* Year-over-year trend */}
+      {village.yearOverYear?.length > 1 && (
+        <div className="bg-white rounded-2xl shadow-sm border border-gray-200 p-6 mb-6">
+          <h4 className="font-semibold text-gray-900 mb-4">
+            Year-Over-Year Road Spending
+          </h4>
+          <div style={{ height: "280px" }}>
+            <Line
+              data={{
+                labels: village.yearOverYear.map((y) => `FY ${y.fiscalYear}`),
+                datasets: [
+                  {
+                    label: "Total Road Spend",
+                    data: village.yearOverYear.map((y) => y.totalRoadSpend),
+                    borderColor: "#2563eb",
+                    backgroundColor: "#2563eb20",
+                    fill: true,
+                    tension: 0.3,
+                    pointRadius: 4,
+                  },
+                  ...(village.yearOverYear.some((y) => y.spendPerCapita)
+                    ? [
+                        {
+                          label: "Spend Per Capita",
+                          data: village.yearOverYear.map((y) => y.spendPerCapita),
+                          borderColor: "#10b981",
+                          backgroundColor: "#10b98120",
+                          fill: false,
+                          tension: 0.3,
+                          pointRadius: 4,
+                          yAxisID: "y1",
+                        },
+                      ]
+                    : []),
+                ],
+              }}
+              options={{
+                responsive: true,
+                maintainAspectRatio: false,
+                interaction: { mode: "index", intersect: false },
+                plugins: {
+                  legend: { position: "top" },
+                  tooltip: {
+                    callbacks: {
+                      label: (ctx) => {
+                        const val = ctx.raw;
+                        return `${ctx.dataset.label}: $${val?.toLocaleString() || "N/A"}`;
+                      },
+                    },
+                  },
+                },
+                scales: {
+                  y: {
+                    type: "linear",
+                    position: "left",
+                    ticks: { callback: (v) => `$${v.toLocaleString()}` },
+                    title: { display: true, text: "Total Spend" },
+                  },
+                  ...(village.yearOverYear.some((y) => y.spendPerCapita)
+                    ? {
+                        y1: {
+                          type: "linear",
+                          position: "right",
+                          grid: { drawOnChartArea: false },
+                          ticks: { callback: (v) => `$${v}` },
+                          title: { display: true, text: "Per Capita" },
+                        },
+                      }
+                    : {}),
+                },
+              }}
+            />
+          </div>
+          <div className="mt-3 text-xs text-gray-400">
+            {village.yearOverYear.length} fiscal years of data available.
+            {(() => {
+              const first = village.yearOverYear[0];
+              const last = village.yearOverYear[village.yearOverYear.length - 1];
+              if (first.totalRoadSpend && last.totalRoadSpend) {
+                const change = ((last.totalRoadSpend - first.totalRoadSpend) / first.totalRoadSpend * 100).toFixed(0);
+                return ` Spending changed ${change > 0 ? "+" : ""}${change}% from FY${first.fiscalYear} to FY${last.fiscalYear}.`;
+              }
+              return "";
+            })()}
           </div>
         </div>
       )}

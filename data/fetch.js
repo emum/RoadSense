@@ -83,6 +83,13 @@ const CATEGORY_LABELS = {
   "259": "Other Expenditures",
 };
 
+// Preventive vs reactive classification based on expenditure categories.
+// Capital outlay (256) represents long-term investment / preventive work.
+// Contractual (252) + commodities (255) represent maintenance / reactive work.
+// Personnel (251) and debt service (257) are excluded from the ratio.
+const PREVENTIVE_CATEGORIES = ["256"]; // Capital outlay
+const REACTIVE_CATEGORIES = ["252", "255"]; // Contractual + commodities
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
@@ -188,11 +195,16 @@ function parseAccessDB(dbPath) {
 
   // Expenditures: group by Code, sum across all fund type columns
   // This gives us total municipal expenditures per unit (for % of budget calc)
+  // Also extract preventive (capital outlay) vs reactive (contractual + commodities)
   const totalExpByUnit = new Map();
+  const preventiveByUnit = new Map();
+  const reactiveByUnit = new Map();
+
   for (const e of expenditures) {
     // Only count "total" category rows (suffix "t") to avoid double-counting
     if (!e.Category.endsWith("t")) continue;
 
+    const catGroup = e.Category.replace(/[a-z]$/, ""); // "256t" -> "256"
     const total = FUND_TYPE_COLUMNS.reduce((sum, col) => sum + parseNum(e[col]), 0);
     if (total <= 0) continue;
 
@@ -200,6 +212,13 @@ function parseAccessDB(dbPath) {
       e.Code,
       (totalExpByUnit.get(e.Code) || 0) + total
     );
+
+    // Classify preventive vs reactive spend
+    if (PREVENTIVE_CATEGORIES.includes(catGroup)) {
+      preventiveByUnit.set(e.Code, (preventiveByUnit.get(e.Code) || 0) + total);
+    } else if (REACTIVE_CATEGORIES.includes(catGroup)) {
+      reactiveByUnit.set(e.Code, (reactiveByUnit.get(e.Code) || 0) + total);
+    }
   }
 
   // Now build village objects for all units that have road funds
@@ -254,9 +273,9 @@ function parseAccessDB(dbPath) {
             ? parseFloat(((totalRoadSpend / totalMunicipalSpend) * 100).toFixed(1))
             : null,
         totalMunicipalSpend,
-        preventiveSpend: null,
-        reactiveSpend: null,
-        preventiveRatio: null,
+        preventiveSpend: preventiveByUnit.get(code) ? Math.round(preventiveByUnit.get(code)) : null,
+        reactiveSpend: reactiveByUnit.get(code) ? Math.round(reactiveByUnit.get(code)) : null,
+        preventiveRatio: null, // Calculated in calculateMetrics
         funds: funds.map((f) => ({
           name: f.fundName,
           type: f.fundType,
@@ -365,14 +384,60 @@ async function main() {
   let fetchedVillages = null;
 
   if (!seedOnly) {
-    // Look for .accdb files in data/raw/
+    // Look for .accdb files in data/raw/ — parse all for multi-year support
     const accdbFiles = fs.existsSync(RAW_DIR)
-      ? fs.readdirSync(RAW_DIR).filter((f) => /\.accdb$/i.test(f))
+      ? fs.readdirSync(RAW_DIR).filter((f) => /\.accdb$/i.test(f)).sort()
       : [];
 
     if (accdbFiles.length > 0) {
-      const dbPath = path.join(RAW_DIR, accdbFiles[0]);
-      fetchedVillages = parseAccessDB(dbPath);
+      // Parse each file — each contains a single fiscal year
+      const allYears = [];
+      for (const file of accdbFiles) {
+        const dbPath = path.join(RAW_DIR, file);
+        console.log(`\nProcessing: ${file}`);
+        const villages = parseAccessDB(dbPath);
+        allYears.push({ file, villages });
+      }
+
+      // Use the most recent file as the primary dataset
+      const primary = allYears[allYears.length - 1];
+      fetchedVillages = primary.villages;
+
+      // Build year-over-year data if multiple files exist
+      if (allYears.length > 1) {
+        console.log(`\nBuilding year-over-year data from ${allYears.length} files...`);
+        const historyByCode = new Map(); // keyed by fips (Comptroller code)
+
+        for (const { file, villages } of allYears) {
+          for (const v of villages) {
+            if (!historyByCode.has(v.fips)) {
+              historyByCode.set(v.fips, []);
+            }
+            historyByCode.get(v.fips).push({
+              fiscalYear: v.fiscalYear,
+              totalRoadSpend: v.roadSpending.totalRoadSpend,
+              spendPerCapita: v.roadSpending.spendPerCapita,
+              population: v.population,
+              totalMunicipalSpend: v.roadSpending.totalMunicipalSpend,
+              roadBudgetPercent: v.roadSpending.roadBudgetPercent,
+              preventiveSpend: v.roadSpending.preventiveSpend,
+              reactiveSpend: v.roadSpending.reactiveSpend,
+              source: file,
+            });
+          }
+        }
+
+        // Attach history to the primary villages
+        for (const v of fetchedVillages) {
+          const history = historyByCode.get(v.fips);
+          if (history && history.length > 1) {
+            v.yearOverYear = history.sort((a, b) => a.fiscalYear - b.fiscalYear);
+          }
+        }
+
+        const withHistory = fetchedVillages.filter((v) => v.yearOverYear).length;
+        console.log(`  ${withHistory} villages have multi-year data`);
+      }
     } else {
       console.log("No .accdb file found in data/raw/.");
       console.log("Download the AFR bulk data from the IL Comptroller:");

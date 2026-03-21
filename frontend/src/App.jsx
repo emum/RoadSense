@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useState, useEffect } from "react";
 import SearchView from "./views/SearchView";
 import BenchmarkView from "./views/BenchmarkView";
 import AboutView from "./views/AboutView";
@@ -14,6 +14,17 @@ const TABS = [
 export default function App() {
   const [tab, setTab] = useState("search");
   const [selectedVillage, setSelectedVillage] = useState(null);
+  const [shareCompare, setShareCompare] = useState(null);
+
+  // Read ?compare= param from URL on load to restore shared comparisons
+  useEffect(() => {
+    const params = new URLSearchParams(window.location.search);
+    const compare = params.get("compare");
+    if (compare) {
+      setShareCompare(compare);
+      setTab("benchmark");
+    }
+  }, []);
 
   function handleSelectVillage(village) {
     setSelectedVillage(village);
@@ -55,7 +66,7 @@ export default function App() {
           <SearchView onSelectVillage={handleSelectVillage} />
         )}
         {tab === "benchmark" && (
-          <BenchmarkView selectedVillage={selectedVillage} />
+          <BenchmarkView selectedVillage={selectedVillage} shareCompare={shareCompare} />
         )}
         {tab === "extract" && <ExtractView />}
         {tab === "about" && <AboutView />}
