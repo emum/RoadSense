@@ -2,29 +2,33 @@
 
 // fetch.js — RoadSense data pipeline
 //
-// Downloads Annual Financial Report (AFR) bulk data from the Illinois
-// Comptroller's Local Government Warehouse, parses it, filters for
-// road/highway-related fund codes, and outputs clean JSON per municipality.
+// Parses Annual Financial Report (AFR) bulk data from the Illinois
+// Comptroller's Local Government Warehouse. The Comptroller publishes
+// this as a Microsoft Access (.accdb) database file, downloadable at:
 //
-// Data source:
 //   https://illinoiscomptroller.gov/constituent-services/local-government/
 //   local-government-division/financial-databases/
 //
-// The Comptroller publishes AFRs as downloadable CSV/Excel files. Each
-// municipality files annually. We look for fund types related to road
-// infrastructure spending:
-//   - Street & Bridge
-//   - Road & Bridge
-//   - Motor Fuel Tax (MFT)
-//   - Special Service Area (road-designated only)
+// The download is manual (form-based, no public API). Place the .accdb
+// file in data/raw/ and run this script.
+//
+// What this script does:
+//   1. Reads the .accdb file from data/raw/
+//   2. Joins UnitData (municipality info) + UnitStats (population) +
+//      FundsUsed (fund names & expenditures) + Expenditures (detailed spending)
+//   3. Filters for road/highway-related funds by matching fund instrument names
+//   4. Calculates: total road spend, spend per capita, % of budget on roads
+//   5. Outputs clean JSON per municipality to data/output/
 //
 // Usage:
-//   node fetch.js              # fetch latest data
-//   node fetch.js --seed-only  # skip fetch, just output seed data
+//   node fetch.js              # parse .accdb from data/raw/
+//   node fetch.js --seed-only  # skip parsing, just output seed data
 
 import fs from "fs";
 import path from "path";
+import { readFileSync } from "fs";
 import { fileURLToPath } from "url";
+import MDBReader from "mdb-reader";
 import { SEED_VILLAGES, BENCHMARKS } from "./seed-data.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -32,26 +36,65 @@ const OUTPUT_DIR = path.join(__dirname, "output");
 const RAW_DIR = path.join(__dirname, "raw");
 
 // ---------------------------------------------------------------------------
-// Fund codes / names that indicate road infrastructure spending.
-// The Comptroller's AFR data uses these fund type descriptions.
+// Fund instrument name patterns that indicate road infrastructure spending.
+// These are matched against the "Instrument" field in the FundsUsed table.
 // ---------------------------------------------------------------------------
 const ROAD_FUND_PATTERNS = [
-  /street\s*&?\s*bridge/i,
-  /road\s*&?\s*bridge/i,
-  /motor\s*fuel\s*tax/i,
-  /MFT/i,
-  /highway/i,
-  /pavement/i,
-  /road\s*improvement/i,
-  /road\s*maintenance/i,
+  /\broad\b/i,
+  /\bstreet\b/i,
+  /\bbridge\b/i,
+  /\bmotor\s*fuel\s*tax\b/i,
+  /\bMFT\b/,
+  /\bhighway\b/i,
+  /\bpavement\b/i,
+  /\bpaving\b/i,
+  /\bcurb\b/i,
+  /\bsidewalk\b/i,
+  /\bstrm?\s*sewer/i, // storm sewer, often bundled with road work
 ];
+
+// Patterns to EXCLUDE — these match "road" or "street" but aren't road spending
+const ROAD_FUND_EXCLUSIONS = [
+  /\bTIF\b/i, // Tax Increment Financing districts named after streets
+  /\bbusiness\s*district\b/i,
+  /\bredevelopment\b/i,
+  /\bbroadband\b/i,
+  /\bfiber\b/i,
+];
+
+// ---------------------------------------------------------------------------
+// IL Comptroller Chart of Accounts — expenditure category codes
+// The Expenditures table uses codes like "251a", "252t", etc.
+// Column codes: GN=General, SR=Special Revenue, CP=Capital Projects,
+//   DS=Debt Service, EP=Enterprise, TS=Trust/Agency, FD=Fiduciary/Pension,
+//   DP=Discretely Presented, OT=Other
+// ---------------------------------------------------------------------------
+const FUND_TYPE_COLUMNS = ["GN", "SR", "CP", "DS", "EP", "TS", "FD", "DP", "OT"];
+
+// Category code groups — from IL Comptroller Chart of Accounts
+// 251 = Personnel services, 252 = Contractual services, 255 = Commodities,
+// 256 = Capital outlay, 257 = Debt service, 259 = Other expenditures
+const CATEGORY_LABELS = {
+  "251": "Personnel Services",
+  "252": "Contractual Services",
+  "255": "Commodities",
+  "256": "Capital Outlay",
+  "257": "Debt Service",
+  "259": "Other Expenditures",
+};
 
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 
-function isRoadFund(fundName) {
-  return ROAD_FUND_PATTERNS.some((pattern) => pattern.test(fundName));
+function isRoadFund(instrumentName) {
+  if (!instrumentName) return false;
+  // Must match at least one inclusion pattern
+  const included = ROAD_FUND_PATTERNS.some((p) => p.test(instrumentName));
+  if (!included) return false;
+  // Must not match any exclusion pattern
+  const excluded = ROAD_FUND_EXCLUSIONS.some((p) => p.test(instrumentName));
+  return !excluded;
 }
 
 function slugify(name) {
@@ -67,210 +110,178 @@ function ensureDir(dir) {
   }
 }
 
-// ---------------------------------------------------------------------------
-// Parse CSV rows into municipality road spending objects
-// ---------------------------------------------------------------------------
-
-/**
- * Parse raw AFR CSV data into structured municipality objects.
- *
- * Expected CSV columns (based on Comptroller bulk download format):
- *   Government Name, Government ID, County, Government Type,
- *   Fund Name, Fund Type, Fiscal Year, Expenditures, Revenue, ...
- *
- * We filter for:
- *   - Government Type containing "Village", "City", or "Town"
- *   - Fund names matching ROAD_FUND_PATTERNS
- *
- * Then aggregate expenditures per municipality per fiscal year.
- */
-function parseAFRData(rows) {
-  // Group by municipality + fiscal year
-  const byMuni = {};
-
-  for (const row of rows) {
-    const govName = (row["Government Name"] || row["government_name"] || "").trim();
-    const govType = (row["Government Type"] || row["government_type"] || "").trim();
-    const fundName = (row["Fund Name"] || row["fund_name"] || "").trim();
-    const county = (row["County"] || row["county"] || "").trim();
-    const govId = (row["Government ID"] || row["government_id"] || "").trim();
-    const fiscalYear = parseInt(row["Fiscal Year"] || row["fiscal_year"] || "0", 10);
-    const expenditures = parseFloat(
-      (row["Expenditures"] || row["expenditures"] || "0").toString().replace(/[,$]/g, "")
-    );
-
-    // Only include municipal governments
-    if (!/village|city|town/i.test(govType)) continue;
-
-    // Only include road-related funds
-    if (!isRoadFund(fundName)) continue;
-
-    // Skip invalid data
-    if (!govName || !fiscalYear || isNaN(expenditures)) continue;
-
-    const key = `${slugify(govName)}-${fiscalYear}`;
-    if (!byMuni[key]) {
-      byMuni[key] = {
-        id: slugify(govName),
-        name: govName,
-        county,
-        state: "IL",
-        fips: govId,
-        population: null, // Will be filled from Census data
-        fiscalYear,
-        funds: [],
-        totalRoadSpend: 0,
-      };
-    }
-
-    byMuni[key].funds.push({ fundName, expenditures });
-    byMuni[key].totalRoadSpend += expenditures;
-  }
-
-  // Convert to final schema
-  return Object.values(byMuni).map((muni) => ({
-    id: muni.id,
-    name: muni.name,
-    county: muni.county,
-    state: muni.state,
-    fips: muni.fips,
-    population: muni.population,
-    fiscalYear: muni.fiscalYear,
-    roadSpending: {
-      totalRoadSpend: Math.round(muni.totalRoadSpend),
-      spendPerCapita: null, // Requires population
-      centerlineMiles: null,
-      laneMiles: null,
-      spendPerLaneMile: null,
-      roadBudgetPercent: null,
-      totalMunicipalSpend: null,
-      preventiveSpend: null,
-      reactiveSpend: null,
-      preventiveRatio: null,
-    },
-    roadConditionScore: null,
-    acceptabilityRate: null,
-    referendumRevenue: null,
-    vendors: [],
-    metadata: {
-      source: "IL Comptroller Local Government Warehouse AFR bulk download",
-      fetchedAt: new Date().toISOString(),
-      fiscalYearEnd: null,
-      notes: `Aggregated from ${muni.funds.length} road-related fund(s): ${muni.funds.map((f) => f.fundName).join(", ")}`,
-    },
-  }));
+// Parse a numeric string from the Access DB (often "12345.0000")
+function parseNum(val) {
+  if (val == null) return 0;
+  const n = parseFloat(String(val).replace(/[,$]/g, ""));
+  return isNaN(n) ? 0 : n;
 }
 
+// C1 code to government type
+const GOV_TYPES = {
+  MU: "Municipality",
+  TW: "Township",
+  CC: "County/Community College",
+  SD: "School District",
+  SP: "Special Purpose",
+  sp: "Special Purpose",
+  HB: "Home Rule/Bond",
+};
+
+// C4 code to municipality sub-type (partial — the ones we care about)
+// 30 = City, 31 = Town, 32 = Village
+const MUNI_SUBTYPES = { 30: "City", 31: "Town", 32: "Village" };
+
 // ---------------------------------------------------------------------------
-// Fetch from Comptroller (when bulk data is available)
+// Parse the Access database
 // ---------------------------------------------------------------------------
 
-/**
- * Attempt to download the latest AFR bulk file from the Comptroller.
- *
- * The Comptroller's download page provides files at URLs that change
- * periodically. This function tries known URL patterns. If the bulk
- * download is unavailable (common — the page sometimes requires manual
- * navigation or CAPTCHA), we fall back to seed data.
- *
- * In production, this should be run on a schedule (e.g., weekly cron)
- * and the admin can trigger it via the /api/refresh endpoint.
- */
-async function fetchComptrollerData() {
-  // Known URL patterns for the Comptroller's bulk data downloads.
-  // These are based on historical URLs — the Comptroller may change them.
-  const POSSIBLE_URLS = [
-    "https://illinoiscomptroller.gov/financial-data/local-government-division/financial-databases/expenditure-data",
-    "https://illinoiscomptroller.gov/financial-data/local-government-division/financial-databases",
-  ];
+function parseAccessDB(dbPath) {
+  console.log(`Reading Access database: ${dbPath}`);
+  const buf = readFileSync(dbPath);
+  const reader = new MDBReader(buf);
 
-  console.log("Attempting to fetch IL Comptroller AFR bulk data...");
-  console.log(
-    "Note: The Comptroller's bulk download page may require manual",
-    "navigation. If auto-fetch fails, download manually from:"
-  );
-  console.log(
-    "  https://illinoiscomptroller.gov/constituent-services/local-government/"
-  );
-  console.log(
-    "  local-government-division/financial-databases/"
-  );
-  console.log();
+  // Load tables into memory
+  const unitData = reader.getTable("UnitData").getData();
+  const unitStats = reader.getTable("UnitStats").getData();
+  const fundsUsed = reader.getTable("FundsUsed").getData();
+  const expenditures = reader.getTable("Expenditures").getData();
 
-  // Try to fetch — this will likely fail in automated environments
-  // because the Comptroller site doesn't expose a stable API.
-  for (const url of POSSIBLE_URLS) {
-    try {
-      const fetch = (await import("node-fetch")).default;
-      const response = await fetch(url, {
-        headers: {
-          "User-Agent": "RoadSense/1.0 (civic open-source project)",
-        },
-        timeout: 30_000,
-      });
+  console.log(`  UnitData: ${unitData.length} units`);
+  console.log(`  UnitStats: ${unitStats.length} records`);
+  console.log(`  FundsUsed: ${fundsUsed.length} funds`);
+  console.log(`  Expenditures: ${expenditures.length} line items`);
 
-      if (response.ok) {
-        const contentType = response.headers.get("content-type") || "";
-
-        if (contentType.includes("csv") || contentType.includes("text")) {
-          const text = await response.text();
-          console.log(`Downloaded ${text.length} bytes from ${url}`);
-
-          // Parse CSV
-          const { parse } = await import("csv-parse/sync");
-          const records = parse(text, {
-            columns: true,
-            skip_empty_lines: true,
-            trim: true,
-          });
-
-          return parseAFRData(records);
-        }
-
-        if (contentType.includes("spreadsheet") || contentType.includes("excel")) {
-          const buffer = await response.arrayBuffer();
-          const XLSX = (await import("xlsx")).default;
-          const workbook = XLSX.read(Buffer.from(buffer));
-          const sheet = workbook.Sheets[workbook.SheetNames[0]];
-          const records = XLSX.utils.sheet_to_json(sheet);
-          return parseAFRData(records);
-        }
-      }
-    } catch (err) {
-      console.log(`Could not fetch from ${url}: ${err.message}`);
-    }
+  // Build lookup maps
+  // UnitData: keyed by Code
+  const unitMap = new Map();
+  for (const u of unitData) {
+    unitMap.set(u.Code, u);
   }
 
-  // Check if user has manually placed a file in raw/
-  const manualFiles = fs.existsSync(RAW_DIR)
-    ? fs.readdirSync(RAW_DIR).filter((f) => /\.(csv|xlsx?)$/i.test(f))
-    : [];
-
-  if (manualFiles.length > 0) {
-    const filePath = path.join(RAW_DIR, manualFiles[0]);
-    console.log(`Found manual download: ${filePath}`);
-
-    if (/\.csv$/i.test(filePath)) {
-      const { parse } = await import("csv-parse/sync");
-      const text = fs.readFileSync(filePath, "utf-8");
-      const records = parse(text, {
-        columns: true,
-        skip_empty_lines: true,
-        trim: true,
-      });
-      return parseAFRData(records);
-    }
-
-    if (/\.xlsx?$/i.test(filePath)) {
-      const XLSX = (await import("xlsx")).default;
-      const workbook = XLSX.readFile(filePath);
-      const sheet = workbook.Sheets[workbook.SheetNames[0]];
-      const records = XLSX.utils.sheet_to_json(sheet);
-      return parseAFRData(records);
-    }
+  // UnitStats: keyed by Code (has population, EAV)
+  const statsMap = new Map();
+  for (const s of unitStats) {
+    statsMap.set(s.Code, s);
   }
 
-  return null;
+  // FundsUsed: group by Code, filter for road-related funds
+  const roadFundsByUnit = new Map();
+  let totalRoadFunds = 0;
+  for (const f of fundsUsed) {
+    if (f.Deleted === "Y") continue;
+    if (!isRoadFund(f.Instrument)) continue;
+
+    totalRoadFunds++;
+    if (!roadFundsByUnit.has(f.Code)) {
+      roadFundsByUnit.set(f.Code, []);
+    }
+    roadFundsByUnit.get(f.Code).push({
+      fundName: f.Instrument,
+      fundType: f.FundType,
+      expenditures: parseNum(f.Expenditures),
+      fiscalYearEnd: f.FYEnd,
+    });
+  }
+
+  console.log(`  Road-related funds found: ${totalRoadFunds} across ${roadFundsByUnit.size} units`);
+
+  // Expenditures: group by Code, sum across all fund type columns
+  // This gives us total municipal expenditures per unit (for % of budget calc)
+  const totalExpByUnit = new Map();
+  for (const e of expenditures) {
+    // Only count "total" category rows (suffix "t") to avoid double-counting
+    if (!e.Category.endsWith("t")) continue;
+
+    const total = FUND_TYPE_COLUMNS.reduce((sum, col) => sum + parseNum(e[col]), 0);
+    if (total <= 0) continue;
+
+    totalExpByUnit.set(
+      e.Code,
+      (totalExpByUnit.get(e.Code) || 0) + total
+    );
+  }
+
+  // Now build village objects for all units that have road funds
+  const villages = [];
+  for (const [code, funds] of roadFundsByUnit) {
+    const unit = unitMap.get(code);
+    const stats = statsMap.get(code);
+    if (!unit) continue;
+
+    // We care about municipalities (MU), townships (TW — many manage roads),
+    // and cities/villages/towns
+    const govType = unit.C1;
+    const subType = MUNI_SUBTYPES[unit.C4] || null;
+
+    // Build a readable name
+    let displayName = unit.UnitName;
+    if (subType && !displayName.toLowerCase().includes(subType.toLowerCase())) {
+      // Don't prefix if name already contains the type
+    }
+
+    const population = stats ? parseNum(stats.Pop) : null;
+    const fiscalYear = stats ? parseNum(stats.FY) : null;
+    const totalRoadSpend = Math.round(funds.reduce((s, f) => s + f.expenditures, 0));
+    const totalMunicipalSpend = totalExpByUnit.get(code)
+      ? Math.round(totalExpByUnit.get(code))
+      : null;
+
+    // Include gov type and county in the ID to avoid collisions between
+    // townships/municipalities with the same name, and same-type units in
+    // different counties (e.g., "Concord Township" in multiple counties)
+    const govSuffix = govType === "TW" ? "-twp" : govType === "SP" || govType === "sp" ? "-sp" : "";
+    const countySuffix = govSuffix ? `-${slugify(unit.County)}` : "";
+    const village = {
+      id: slugify(displayName) + govSuffix + countySuffix,
+      name: displayName + (govType === "TW" ? " (Township)" : ""),
+      county: unit.County,
+      state: "IL",
+      fips: code, // IL Comptroller unit code (e.g., "049/190/32")
+      population: population || null,
+      fiscalYear: fiscalYear || null,
+      govType: GOV_TYPES[govType] || govType,
+      subType: subType,
+
+      roadSpending: {
+        totalRoadSpend,
+        spendPerCapita: population ? Math.round(totalRoadSpend / population) : null,
+        centerlineMiles: null, // Not in Comptroller data
+        laneMiles: null,
+        spendPerLaneMile: null,
+        roadBudgetPercent:
+          totalMunicipalSpend && totalMunicipalSpend > 0
+            ? parseFloat(((totalRoadSpend / totalMunicipalSpend) * 100).toFixed(1))
+            : null,
+        totalMunicipalSpend,
+        preventiveSpend: null,
+        reactiveSpend: null,
+        preventiveRatio: null,
+        funds: funds.map((f) => ({
+          name: f.fundName,
+          type: f.fundType,
+          expenditures: Math.round(f.expenditures),
+        })),
+      },
+
+      roadConditionScore: null,
+      acceptabilityRate: null,
+      referendumRevenue: null,
+      vendors: [],
+
+      metadata: {
+        source: "IL Comptroller Local Government Warehouse AFR bulk download (data2025.accdb)",
+        fetchedAt: new Date().toISOString(),
+        fiscalYearEnd: funds[0]?.fiscalYearEnd || null,
+        notes: `Parsed from ${funds.length} road-related fund(s): ${funds.map((f) => f.fundName).join(", ")}`,
+      },
+    };
+
+    villages.push(village);
+  }
+
+  console.log(`  Built ${villages.length} village objects with road spending data`);
+  return villages;
 }
 
 // ---------------------------------------------------------------------------
@@ -283,19 +294,31 @@ function mergeWithSeedData(fetchedVillages) {
     return SEED_VILLAGES;
   }
 
-  // Build a map of seed villages by ID for quick lookup
+  // Seed data takes priority (manually verified, has extra fields like vendors)
   const seedMap = new Map(SEED_VILLAGES.map((v) => [v.id, v]));
-
-  // Merge: seed data takes priority (it has manually verified fields)
   const merged = [...SEED_VILLAGES];
+  let addedCount = 0;
+
   for (const fetched of fetchedVillages) {
     if (!seedMap.has(fetched.id)) {
       merged.push(fetched);
+      addedCount++;
+    } else {
+      // For seed villages that also appear in Comptroller data, merge in
+      // any fields the seed data doesn't have
+      const seed = seedMap.get(fetched.id);
+      if (!seed.roadSpending.totalMunicipalSpend && fetched.roadSpending.totalMunicipalSpend) {
+        seed.roadSpending.totalMunicipalSpend = fetched.roadSpending.totalMunicipalSpend;
+        seed.roadSpending.roadBudgetPercent = fetched.roadSpending.roadBudgetPercent;
+      }
+      if (!seed.roadSpending.funds) {
+        seed.roadSpending.funds = fetched.roadSpending.funds;
+      }
     }
   }
 
   console.log(
-    `Merged ${merged.length} villages (${SEED_VILLAGES.length} seed + ${merged.length - SEED_VILLAGES.length} from Comptroller)`
+    `Merged: ${SEED_VILLAGES.length} seed + ${addedCount} from Comptroller = ${merged.length} total`
   );
   return merged;
 }
@@ -340,50 +363,88 @@ async function main() {
   console.log();
 
   let fetchedVillages = null;
+
   if (!seedOnly) {
-    fetchedVillages = await fetchComptrollerData();
+    // Look for .accdb files in data/raw/
+    const accdbFiles = fs.existsSync(RAW_DIR)
+      ? fs.readdirSync(RAW_DIR).filter((f) => /\.accdb$/i.test(f))
+      : [];
+
+    if (accdbFiles.length > 0) {
+      const dbPath = path.join(RAW_DIR, accdbFiles[0]);
+      fetchedVillages = parseAccessDB(dbPath);
+    } else {
+      console.log("No .accdb file found in data/raw/.");
+      console.log("Download the AFR bulk data from the IL Comptroller:");
+      console.log(
+        "  https://illinoiscomptroller.gov/constituent-services/local-government/"
+      );
+      console.log("  local-government-division/financial-databases/");
+      console.log();
+      console.log("Select a fiscal year, download the .accdb file, and place it in data/raw/.");
+      console.log("Then re-run: node fetch.js");
+      console.log();
+      console.log("Falling back to seed data only.");
+    }
   }
 
   const allVillages = mergeWithSeedData(fetchedVillages);
-
-  // Calculate derived metrics for all villages
   const processed = allVillages.map(calculateMetrics);
 
   // Write output
   ensureDir(OUTPUT_DIR);
 
-  // Write individual village files
+  // Individual village files
   for (const village of processed) {
     const filePath = path.join(OUTPUT_DIR, `${village.id}.json`);
     fs.writeFileSync(filePath, JSON.stringify(village, null, 2));
   }
 
-  // Write combined file
+  // Combined file
   const combinedPath = path.join(OUTPUT_DIR, "all-villages.json");
   fs.writeFileSync(combinedPath, JSON.stringify(processed, null, 2));
 
-  // Write benchmarks
+  // Benchmarks
   const benchmarksPath = path.join(OUTPUT_DIR, "benchmarks.json");
   fs.writeFileSync(benchmarksPath, JSON.stringify(BENCHMARKS, null, 2));
 
-  // Write index (for quick lookups)
+  // Index (for quick lookups by the API)
   const index = processed.map((v) => ({
     id: v.id,
     name: v.name,
     county: v.county,
     population: v.population,
     fiscalYear: v.fiscalYear,
+    govType: v.govType || null,
+    subType: v.subType || null,
     spendPerCapita: v.roadSpending.spendPerCapita,
+    totalRoadSpend: v.roadSpending.totalRoadSpend,
   }));
   const indexPath = path.join(OUTPUT_DIR, "index.json");
   fs.writeFileSync(indexPath, JSON.stringify(index, null, 2));
 
   console.log();
   console.log(`Wrote ${processed.length} village files to ${OUTPUT_DIR}/`);
-  console.log(`  - Individual JSON files per village`);
-  console.log(`  - all-villages.json (combined)`);
-  console.log(`  - benchmarks.json`);
-  console.log(`  - index.json (quick lookup)`);
+  console.log("  - Individual JSON files per village");
+  console.log("  - all-villages.json (combined)");
+  console.log("  - benchmarks.json");
+  console.log("  - index.json (quick lookup)");
+
+  // Summary stats
+  const withPop = processed.filter((v) => v.population);
+  const withRoadSpend = processed.filter((v) => v.roadSpending.totalRoadSpend > 0);
+  console.log();
+  console.log(`Summary:`);
+  console.log(`  Total villages: ${processed.length}`);
+  console.log(`  With population data: ${withPop.length}`);
+  console.log(`  With road spending: ${withRoadSpend.length}`);
+  if (withPop.length > 0) {
+    const avgSpendPerCapita =
+      Math.round(
+        withPop.reduce((s, v) => s + (v.roadSpending.spendPerCapita || 0), 0) / withPop.length
+      );
+    console.log(`  Avg spend per capita: $${avgSpendPerCapita}`);
+  }
   console.log();
   console.log("Done.");
 }

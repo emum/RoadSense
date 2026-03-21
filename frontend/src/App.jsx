@@ -2,10 +2,12 @@ import { useState } from "react";
 import SearchView from "./views/SearchView";
 import BenchmarkView from "./views/BenchmarkView";
 import AboutView from "./views/AboutView";
+import ExtractView from "./views/ExtractView";
 
 const TABS = [
   { id: "search", label: "Search" },
   { id: "benchmark", label: "Benchmark" },
+  { id: "extract", label: "Extract Data" },
   { id: "about", label: "About" },
 ];
 
@@ -55,6 +57,7 @@ export default function App() {
         {tab === "benchmark" && (
           <BenchmarkView selectedVillage={selectedVillage} />
         )}
+        {tab === "extract" && <ExtractView />}
         {tab === "about" && <AboutView />}
       </main>
 
