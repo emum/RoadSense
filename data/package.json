@@ -1,0 +1,18 @@
+{
+  "name": "roadsense-data",
+  "version": "1.0.0",
+  "description": "Data fetching and parsing for RoadSense — IL Comptroller road spending data",
+  "type": "module",
+  "scripts": {
+    "fetch": "node fetch.js",
+    "lint": "eslint ."
+  },
+  "dependencies": {
+    "csv-parse": "^5.5.0",
+    "node-fetch": "^3.3.0",
+    "xlsx": "^0.18.5"
+  },
+  "devDependencies": {
+    "eslint": "^8.50.0"
+  }
+}

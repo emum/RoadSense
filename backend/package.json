@@ -1,0 +1,21 @@
+{
+  "name": "roadsense-backend",
+  "version": "1.0.0",
+  "description": "RoadSense API server — road spending data for IL municipalities",
+  "type": "module",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node --watch server.js",
+    "lint": "eslint .",
+    "test": "node --test tests/"
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.39.0",
+    "cors": "^2.8.5",
+    "dotenv": "^16.3.1",
+    "express": "^4.18.2"
+  },
+  "devDependencies": {
+    "eslint": "^8.50.0"
+  }
+}
