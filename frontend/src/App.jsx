@@ -3,10 +3,12 @@ import SearchView from "./views/SearchView";
 import BenchmarkView from "./views/BenchmarkView";
 import AboutView from "./views/AboutView";
 import ExtractView from "./views/ExtractView";
+import SubmitView from "./views/SubmitView";
 
 const TABS = [
   { id: "search", label: "Search" },
   { id: "benchmark", label: "Benchmark" },
+  { id: "submit", label: "Submit Data" },
   { id: "extract", label: "Extract Data" },
   { id: "about", label: "About" },
 ];
@@ -68,6 +70,7 @@ export default function App() {
         {tab === "benchmark" && (
           <BenchmarkView selectedVillage={selectedVillage} shareCompare={shareCompare} />
         )}
+        {tab === "submit" && <SubmitView />}
         {tab === "extract" && <ExtractView />}
         {tab === "about" && <AboutView />}
       </main>

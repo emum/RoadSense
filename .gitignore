@@ -5,4 +5,5 @@ dist/
 .DS_Store
 data/output/
 data/raw/
+data/submissions/
 coverage/

@@ -738,6 +738,220 @@ app.post("/api/extract/save", (req, res) => {
   });
 });
 
+// ---------------------------------------------------------------------------
+// Community Submissions — crowdsourced data from residents
+// Submissions go into a review queue. Admins approve them to merge into
+// the live dataset.
+// ---------------------------------------------------------------------------
+
+const SUBMISSIONS_DIR = path.join(__dirname, "../data/submissions");
+if (!fs.existsSync(SUBMISSIONS_DIR)) {
+  fs.mkdirSync(SUBMISSIONS_DIR, { recursive: true });
+}
+
+// POST /api/submit — submit village data (road condition score, spend, etc.)
+app.post("/api/submit", (req, res) => {
+  const { villageName, submitterName, submitterEmail, data, sourceUrl, sourceDescription } = req.body;
+
+  if (!villageName || !data) {
+    return res.status(400).json({
+      error: "Provide villageName and data in request body",
+    });
+  }
+
+  // Validate that at least one useful field was submitted
+  const validFields = [
+    "roadConditionScore",
+    "totalRoadSpend",
+    "population",
+    "centerlineMiles",
+    "referendumRevenue",
+    "vendors",
+  ];
+  const hasUsefulData = validFields.some((f) => data[f] != null);
+  if (!hasUsefulData) {
+    return res.status(400).json({
+      error: "Submit at least one data field: " + validFields.join(", "),
+    });
+  }
+
+  // Validate road condition score range
+  if (data.roadConditionScore != null) {
+    const score = Number(data.roadConditionScore);
+    if (isNaN(score) || score < 0 || score > 100) {
+      return res.status(400).json({ error: "roadConditionScore must be 0-100" });
+    }
+    data.roadConditionScore = score;
+  }
+
+  // Build submission record
+  const submission = {
+    id: `sub_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
+    villageName: villageName.trim(),
+    submitter: {
+      name: submitterName?.trim() || "Anonymous",
+      email: submitterEmail?.trim() || null,
+    },
+    data,
+    source: {
+      url: sourceUrl?.trim() || null,
+      description: sourceDescription?.trim() || null,
+    },
+    status: "pending", // pending | approved | rejected
+    submittedAt: new Date().toISOString(),
+    reviewedAt: null,
+    reviewNotes: null,
+  };
+
+  // Save to disk
+  const filePath = path.join(SUBMISSIONS_DIR, `${submission.id}.json`);
+  fs.writeFileSync(filePath, JSON.stringify(submission, null, 2));
+
+  console.log(`New submission: ${submission.id} for ${villageName}`);
+
+  res.json({
+    message: "Thank you! Your submission is pending review.",
+    submissionId: submission.id,
+  });
+});
+
+// GET /api/submissions — list all submissions (admin only)
+app.get("/api/submissions", (req, res) => {
+  const adminKey = process.env.ADMIN_API_KEY;
+  if (adminKey) {
+    const providedKey = req.headers["x-api-key"] || req.query.key;
+    if (providedKey !== adminKey) {
+      return res.status(403).json({ error: "Invalid API key" });
+    }
+  }
+
+  const files = fs.existsSync(SUBMISSIONS_DIR)
+    ? fs.readdirSync(SUBMISSIONS_DIR).filter((f) => f.endsWith(".json"))
+    : [];
+
+  const submissions = files.map((f) =>
+    JSON.parse(fs.readFileSync(path.join(SUBMISSIONS_DIR, f), "utf-8"))
+  );
+
+  // Sort newest first
+  submissions.sort((a, b) => new Date(b.submittedAt) - new Date(a.submittedAt));
+
+  const status = req.query.status;
+  const filtered = status
+    ? submissions.filter((s) => s.status === status)
+    : submissions;
+
+  res.json({ submissions: filtered, total: submissions.length });
+});
+
+// POST /api/submissions/:id/approve — approve a submission and merge into dataset
+app.post("/api/submissions/:id/approve", (req, res) => {
+  const adminKey = process.env.ADMIN_API_KEY;
+  if (adminKey) {
+    const providedKey = req.headers["x-api-key"] || req.query.key;
+    if (providedKey !== adminKey) {
+      return res.status(403).json({ error: "Invalid API key" });
+    }
+  }
+
+  const filePath = path.join(SUBMISSIONS_DIR, `${req.params.id}.json`);
+  if (!fs.existsSync(filePath)) {
+    return res.status(404).json({ error: "Submission not found" });
+  }
+
+  const submission = JSON.parse(fs.readFileSync(filePath, "utf-8"));
+  if (submission.status !== "pending") {
+    return res.status(400).json({ error: `Submission already ${submission.status}` });
+  }
+
+  // Find the matching village
+  const slugify = (name) =>
+    name.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/(^-|-$)/g, "");
+
+  const village = villages.find(
+    (v) =>
+      v.id === slugify(submission.villageName) ||
+      v.name.toLowerCase() === submission.villageName.toLowerCase()
+  );
+
+  if (!village) {
+    return res.status(404).json({
+      error: `Village "${submission.villageName}" not found in dataset`,
+    });
+  }
+
+  // Merge submitted data into the village
+  const d = submission.data;
+  if (d.roadConditionScore != null) village.roadConditionScore = d.roadConditionScore;
+  if (d.totalRoadSpend != null) village.roadSpending.totalRoadSpend = d.totalRoadSpend;
+  if (d.population != null) village.population = d.population;
+  if (d.centerlineMiles != null) {
+    village.roadSpending.centerlineMiles = d.centerlineMiles;
+    village.roadSpending.laneMiles = d.centerlineMiles * 2;
+  }
+  if (d.referendumRevenue != null) village.referendumRevenue = d.referendumRevenue;
+  if (d.vendors?.length > 0) {
+    village.vendors = [...(village.vendors || []), ...d.vendors];
+  }
+
+  // Recalculate derived metrics
+  const rs = village.roadSpending;
+  if (village.population && rs.totalRoadSpend) {
+    rs.spendPerCapita = Math.round(rs.totalRoadSpend / village.population);
+  }
+  if (rs.laneMiles && rs.totalRoadSpend) {
+    rs.spendPerLaneMile = Math.round(rs.totalRoadSpend / rs.laneMiles);
+  }
+
+  // Add source note
+  const sourceNote = submission.source.url
+    ? `Community submission (${submission.source.description || submission.source.url})`
+    : `Community submission by ${submission.submitter.name}`;
+  village.metadata.notes = village.metadata.notes
+    ? `${village.metadata.notes} | ${sourceNote}`
+    : sourceNote;
+
+  // Save updated village to disk
+  const villageFilePath = path.join(DATA_DIR, `${village.id}.json`);
+  fs.writeFileSync(villageFilePath, JSON.stringify(village, null, 2));
+
+  // Update combined file
+  const allPath = path.join(DATA_DIR, "all-villages.json");
+  fs.writeFileSync(allPath, JSON.stringify(villages, null, 2));
+
+  // Mark submission as approved
+  submission.status = "approved";
+  submission.reviewedAt = new Date().toISOString();
+  submission.reviewNotes = req.body.notes || null;
+  fs.writeFileSync(filePath, JSON.stringify(submission, null, 2));
+
+  res.json({ message: `Approved and merged into ${village.name}`, village });
+});
+
+// POST /api/submissions/:id/reject — reject a submission
+app.post("/api/submissions/:id/reject", (req, res) => {
+  const adminKey = process.env.ADMIN_API_KEY;
+  if (adminKey) {
+    const providedKey = req.headers["x-api-key"] || req.query.key;
+    if (providedKey !== adminKey) {
+      return res.status(403).json({ error: "Invalid API key" });
+    }
+  }
+
+  const filePath = path.join(SUBMISSIONS_DIR, `${req.params.id}.json`);
+  if (!fs.existsSync(filePath)) {
+    return res.status(404).json({ error: "Submission not found" });
+  }
+
+  const submission = JSON.parse(fs.readFileSync(filePath, "utf-8"));
+  submission.status = "rejected";
+  submission.reviewedAt = new Date().toISOString();
+  submission.reviewNotes = req.body.notes || null;
+  fs.writeFileSync(filePath, JSON.stringify(submission, null, 2));
+
+  res.json({ message: "Submission rejected" });
+});
+
 // GET /api/refresh — re-fetch Comptroller data (admin only)
 app.get("/api/refresh", async (req, res) => {
   const adminKey = process.env.ADMIN_API_KEY;

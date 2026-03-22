@@ -83,6 +83,19 @@ export async function saveExtracted(extracted, sourceUrl) {
   return res.json();
 }
 
+export async function submitVillageData(submission) {
+  const res = await fetch(`${BASE}/submit`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(submission),
+  });
+  if (!res.ok) {
+    const body = await res.json().catch(() => ({}));
+    throw new Error(body.error || `Submission failed: ${res.status}`);
+  }
+  return res.json();
+}
+
 export async function analyzeVillage(villageName) {
   const res = await fetch(`${BASE}/analyze`, {
     method: "POST",
